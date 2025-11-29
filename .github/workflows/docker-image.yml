@@ -1,0 +1,76 @@
+name: docker-build-push  # 工作流名称，可自定义
+
+# 触发工作流的事件（重点：根据需求调整分支和标签规则）
+on:
+  push:
+    branches:
+      - "main"  # 你的仓库主分支是main，无需修改
+    tags:
+      - 'v*'  # 推送以 v 开头的标签时触发（如 v1.0.0，用于版本发布）
+  pull_request:
+    branches:
+      - "main"  # 针对main分支的PR触发（仅构建，不推送镜像）
+
+# 工作流任务（一个工作流可包含多个 job，此处仅需 build 任务）
+jobs:
+  build:
+    runs-on: ubuntu-latest  # 运行环境：最新版 Ubuntu
+
+    # 环境变量（根据你的项目修改！）
+    env:
+      REGISTRY: 'docker.io'  # 镜像仓库地址（默认 Docker Hub，无需修改）
+      IMAGE_NAME: 'qxdljy/gemini-link-system'  # 你的Docker镜像名，无需修改
+
+    # 任务步骤（按顺序执行）
+    steps:
+      # 步骤 1：检出 GitHub 仓库代码（让工作流获取项目文件）
+      - name: Checkout code
+        uses: actions/checkout@v3  # 复用官方的检出动作，v3 是稳定版本
+
+      # 步骤 2：配置Python环境（适配你的Python项目）
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'  # 根据你的项目Python版本调整（如3.9/3.11）
+          cache: 'pip'  # 缓存pip依赖，加速构建
+
+      # 步骤 3：安装Python依赖（如果有requirements.txt）
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      # 步骤 4：构建 Docker 镜像（基于项目中的Dockerfile）
+      - name: Build Docker image
+        run: docker build -f ./Dockerfile . --tag ${{ env.IMAGE_NAME }}:latest
+
+      # 步骤 5：登录 Docker Hub（仅非 PR 事件执行，避免泄露凭证）
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'  # PR 事件跳过登录（仅构建不推送）
+        uses: docker/login-action@v2  # 复用官方的Docker登录动作
+        with:
+          registry: ${{ env.REGISTRY }}  # 镜像仓库地址（默认 Docker Hub）
+          username: ${{ secrets.DOCKER_USERNAME }}  # 从Secrets取Docker用户名
+          password: ${{ secrets.DOCKER_PASSWORD }}  # 从Secrets取Docker密码
+
+      # 步骤 6：提取 Docker 镜像元数据（自动生成标签，如 v1.0.0）
+      - name: Extract Docker metadata
+        id: meta  # 步骤ID，后续可通过steps.meta引用输出
+        uses: docker/metadata-action@v4  # 复用官方的元数据提取动作
+        with:
+          images: ${{ env.IMAGE_NAME }}  # 关联的镜像名称
+          tags: |
+            # 规则1：main分支推送时，标签为latest
+            type=raw,value=latest,enable={{is_default_branch}}
+            # 规则2：推送标签（如v1.0.0）时，镜像标签同步为该版本号
+            type=ref,enable=true,priority=600,prefix=,suffix=,event=tag
+
+      # 步骤 7：构建并推送 Docker 镜像（最终步骤）
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5  # 升级到v5版本，提升兼容性
+        with:
+          context: .  # Docker构建上下文（当前项目根目录）
+          file: ./Dockerfile  # Dockerfile路径
+          push: ${{ github.event_name != 'pull_request' }}  # PR事件不推送，其他事件推送
+          tags: ${{ steps.meta.outputs.tags }}  # 使用步骤6生成的标签
+          labels: ${{ steps.meta.outputs.labels }}  # 自动生成镜像标签
