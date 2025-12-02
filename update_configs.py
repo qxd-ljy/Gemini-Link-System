@@ -6,6 +6,12 @@ Gemini Business 配置更新脚本
 import time
 import re
 import logging
+import signal
+import atexit
+import threading
+import sys
+import os
+import io
 from typing import List, Dict, Optional, Any
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -17,13 +23,78 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException
 import httpx
 from urllib.parse import quote
 
+# 全局变量：存储所有打开的浏览器驱动，用于中断时关闭
+_active_drivers: List[webdriver.Edge] = []
+_drivers_lock = threading.Lock()  # 线程锁，保护 _active_drivers 列表
+
+def cleanup_drivers():
+    """清理所有打开的浏览器驱动"""
+    global _active_drivers
+    with _drivers_lock:
+        drivers_to_close = _active_drivers[:]  # 复制列表，避免在迭代时修改
+        _active_drivers.clear()
+    
+    if drivers_to_close:
+        logger.info(f"🛑 正在关闭 {len(drivers_to_close)} 个浏览器窗口...")
+        for driver in drivers_to_close:
+            try:
+                driver.quit()
+            except Exception as e:
+                logger.debug(f"关闭浏览器时出错: {e}")
+        logger.info("✅ 所有浏览器窗口已关闭")
+
+def signal_handler(signum, frame):
+    """信号处理函数：中断时关闭所有浏览器"""
+    logger.info("🛑 收到中断信号，正在关闭所有浏览器...")
+    try:
+        cleanup_drivers()
+    except Exception as e:
+        logger.error(f"清理浏览器时出错: {e}")
+    import sys
+    sys.exit(0)
+
+# 注册信号处理（Windows 和 Unix 都支持）
+try:
+    # 注册 SIGINT（Ctrl+C）
+    if hasattr(signal, 'SIGINT'):
+        signal.signal(signal.SIGINT, signal_handler)
+    # 注册 SIGTERM（如果可用）
+    if hasattr(signal, 'SIGTERM'):
+        try:
+            signal.signal(signal.SIGTERM, signal_handler)
+        except (ValueError, OSError):
+            # Windows 上 SIGTERM 可能不可用，忽略错误
+            pass
+except Exception as e:
+    logger.debug(f"注册信号处理失败: {e}")
+
+# 注册退出时清理（确保即使正常退出也能清理）
+atexit.register(cleanup_drivers)
+
+# 配置日志（确保 Unicode 字符正确显示）
+# 确保 stdout 使用 UTF-8 编码（Windows 上需要）
+if sys.platform == 'win32':
+    if hasattr(sys.stdout, 'reconfigure'):
+        try:
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+    if hasattr(sys.stderr, 'reconfigure'):
+        try:
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+
+# 创建使用 UTF-8 编码的 StreamHandler
+handler = logging.StreamHandler(sys.stdout)
+handler.setLevel(logging.INFO)
+handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S"))
+
 # 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%H:%M:%S",
-)
 logger = logging.getLogger("update-configs")
+logger.setLevel(logging.INFO)
+logger.addHandler(handler)
+logger.propagate = False  # 防止重复输出
 
 # 禁用 Selenium 和浏览器驱动的冗余日志
 logging.getLogger("selenium").setLevel(logging.ERROR)
@@ -35,8 +106,6 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # 过滤浏览器驱动的错误输出
-import sys
-import os
 if sys.platform == 'win32':
     try:
         original_stderr = sys.stderr
@@ -145,11 +214,14 @@ GPTMAIL_API_KEY = "gpt-test"  # 测试 Key
 class GPTMailClient:
     """GPTMail 临时邮箱客户端 - 用于接收验证码"""
     
-    def __init__(self, base_url: str = GPTMAIL_BASE_URL, driver: Optional[webdriver.Edge] = None):
+    def __init__(self, base_url: str = GPTMAIL_BASE_URL, driver: Optional[webdriver.Edge] = None, 
+                 account_index: int = 0, total_accounts: int = 0):
         self.base_url = base_url
         self.client = httpx.Client(timeout=30.0, follow_redirects=True)
         self.driver = driver
         self.email_address: Optional[str] = None
+        self.account_index = account_index
+        self.total_accounts = total_accounts
         
         self.client.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
@@ -185,12 +257,14 @@ class GPTMailClient:
                 return emails
             return []
         except Exception as e:
-            logger.debug(f"获取邮件异常: {e}")
+            prefix = f"[{self.account_index}/{self.total_accounts}]"
+            logger.debug(f"{prefix} 获取邮件异常: {e}")
             return []
     
     def wait_for_verification_code(self, email: str, max_wait: int = 30, check_interval: int = 3) -> Optional[str]:
         """等待并提取验证码"""
-        logger.info(f"⏳ 等待验证邮件... (最多等待 {max_wait} 秒)")
+        prefix = f"[{self.account_index}/{self.total_accounts}]"
+        logger.info(f"{prefix} ⏳ 等待验证邮件... (最多等待 {max_wait} 秒)")
         start_time = time.time()
         last_log_time = 0
         
@@ -212,16 +286,16 @@ class GPTMailClient:
                         code = self._extract_verification_code(content)
                         if code:
                             elapsed = int(time.time() - start_time)
-                            logger.info(f"✅ 找到验证码: {code} (耗时: {elapsed} 秒)")
+                            logger.info(f"{prefix} ✅ 找到验证码: {code} (耗时: {elapsed} 秒)")
                             return code
             
             elapsed = int(time.time() - start_time)
             if elapsed - last_log_time >= 10:
-                logger.info(f"⏳ 等待中... ({elapsed}/{max_wait} 秒)")
+                logger.info(f"{prefix} ⏳ 等待中... ({elapsed}/{max_wait} 秒)")
                 last_log_time = elapsed
             time.sleep(check_interval)
         
-        logger.error(f"❌ 等待邮件超时 ({max_wait} 秒)")
+        logger.error(f"{prefix} ❌ 等待邮件超时 ({max_wait} 秒)")
         return None
     
     def _extract_verification_code(self, content: str) -> Optional[str]:
@@ -303,28 +377,31 @@ def parse_config_file(file_path: str) -> List[Dict[str, str]]:
         return []
 
 
-def extract_config_from_browser(driver: webdriver.Edge, email: str) -> Optional[Dict[str, str]]:
+def extract_config_from_browser(driver: webdriver.Edge, email: str, account_index: int = 0, total_accounts: int = 0) -> Optional[Dict[str, str]]:
     """
     从浏览器中提取配置信息
     
     Args:
         driver: 浏览器驱动
         email: 邮箱地址
+        account_index: 账号索引
+        total_accounts: 总账号数
         
     Returns:
         配置信息字典，如果失败返回 None
     """
+    prefix = f"[{account_index}/{total_accounts}]"
     try:
         # 等待页面加载
         time.sleep(5)
         
         # 获取当前URL
         current_url = driver.current_url
-        logger.debug(f"📄 当前页面: {current_url}")
+        logger.debug(f"{prefix} 📄 当前页面: {current_url}")
         
         # 检查是否在正确的页面
         if "business.gemini.google" not in current_url:
-            logger.warning(f"⚠️ 当前不在 Gemini Business 页面: {current_url}")
+            logger.warning(f"{prefix} ⚠️ 当前不在 Gemini Business 页面: {current_url}")
             return None
         
         # 提取 CONFIG_ID (从路径 /cid/ 后面)
@@ -362,7 +439,7 @@ def extract_config_from_browser(driver: webdriver.Edge, email: str) -> Optional[
                     # 转换为 datetime 对象（北京时间，naive）
                     expires_dt = datetime.fromtimestamp(expires_timestamp, tz=timezone(timedelta(hours=8)))
                     cookie_expires_at = expires_dt.replace(tzinfo=None)
-                    logger.debug(f"从浏览器 Cookie 获取过期时间: {cookie_expires_at}")
+                    logger.debug(f"{prefix} 从浏览器 Cookie 获取过期时间: {cookie_expires_at}")
             elif cookie['name'] == '__Host-C_OSES' and cookie.get('domain', '').endswith('gemini.google'):
                 host_c_oses = cookie['value']
                 # 如果 HOST_C_OSES 有过期时间且更晚，使用它
@@ -373,11 +450,11 @@ def extract_config_from_browser(driver: webdriver.Edge, email: str) -> Optional[
                     host_expires = expires_dt.replace(tzinfo=None)
                     if not cookie_expires_at or host_expires > cookie_expires_at:
                         cookie_expires_at = host_expires
-                        logger.debug(f"从浏览器 Cookie (HOST_C_OSES) 获取过期时间: {cookie_expires_at}")
+                        logger.debug(f"{prefix} 从浏览器 Cookie (HOST_C_OSES) 获取过期时间: {cookie_expires_at}")
         
         # 如果信息不完整，等待并重试
         if not config_id or not csesidx or not secure_c_ses:
-            logger.info("⏳ 等待页面完全加载...")
+            logger.info(f"{prefix} ⏳ 等待页面完全加载...")
             time.sleep(10)
             current_url = driver.current_url
             
@@ -413,13 +490,13 @@ def extract_config_from_browser(driver: webdriver.Edge, email: str) -> Optional[
                 'HOST_C_OSES': host_c_oses or ''
             }
         else:
-            logger.warning(f"⚠️ 配置信息不完整: CONFIG_ID={config_id}, CSESIDX={csesidx}, SECURE_C_SES={'已找到' if secure_c_ses else '未找到'}")
+            logger.warning(f"{prefix} ⚠️ 配置信息不完整: CONFIG_ID={config_id}, CSESIDX={csesidx}, SECURE_C_SES={'已找到' if secure_c_ses else '未找到'}")
             return None
             
     except Exception as e:
-        logger.error(f"❌ 提取配置信息失败: {e}")
+        logger.error(f"{prefix} ❌ 提取配置信息失败: {e}")
         import traceback
-        logger.debug(traceback.format_exc())
+        logger.debug(f"{prefix} {traceback.format_exc()}")
         return None
 
 
@@ -444,29 +521,10 @@ def login_and_update_config(account: Dict[str, str], account_index: int, total_a
     
     driver = None
     try:
-        # 初始化浏览器
+        # 初始化浏览器（使用 Selenium 管理的 Edge，不使用本机 Edge）
         edge_options = Options()
         
-        # 使用本机 Edge 浏览器
-        import os
-        import platform
-        
-        if platform.system() == "Windows":
-            edge_paths = [
-                r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-                r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-                os.path.expanduser(r"~\AppData\Local\Microsoft\Edge\Application\msedge.exe"),
-            ]
-            
-            edge_binary = None
-            for path in edge_paths:
-                if os.path.exists(path):
-                    edge_binary = path
-                    break
-            
-            if edge_binary:
-                edge_options.binary_location = edge_binary
-        
+        # 使用隐私模式
         edge_options.add_argument("--inprivate")
         edge_options.add_argument("--no-sandbox")
         edge_options.add_argument("--disable-dev-shm-usage")
@@ -507,6 +565,18 @@ def login_and_update_config(account: Dict[str, str], account_index: int, total_a
         service = Service()
         driver = webdriver.Edge(options=edge_options, service=service)
         
+        # 将驱动添加到全局列表，用于中断时关闭
+        with _drivers_lock:
+            _active_drivers.append(driver)
+        
+        # 有头模式下最小化窗口
+        if not HEADLESS_MODE:
+            try:
+                driver.minimize_window()
+                logger.info(f"[{account_index}/{total_accounts}] 🔽 浏览器窗口已最小化")
+            except Exception as e:
+                logger.debug(f"[{account_index}/{total_accounts}] 最小化窗口失败: {e}")
+        
         # 访问 Google Business 登录页面
         login_url = "https://auth.business.gemini.google/login?continueUrl=https://business.gemini.google/"
         logger.info(f"🔗 [{account_index}/{total_accounts}] 访问登录页面...")
@@ -534,87 +604,147 @@ def login_and_update_config(account: Dict[str, str], account_index: int, total_a
             logger.info(f"📧 [{account_index}/{total_accounts}] 需要验证码，开始自动获取...")
             
             # 创建 GPTMail 客户端并等待验证码
-            gptmail = GPTMailClient(driver=driver)
-            verification_code = gptmail.wait_for_verification_code(
-                email=email,
-                max_wait=30,
-                check_interval=3
-            )
+            gptmail = GPTMailClient(driver=driver, account_index=account_index, total_accounts=total_accounts)
             
-            if verification_code:
-                logger.info(f"🔐 [{account_index}/{total_accounts}] 提交验证码: {verification_code}")
+            # 验证码重试机制（最多重试1次）
+            max_retries = 1
+            verification_success = False
+            
+            for retry_count in range(max_retries + 1):
+                if retry_count > 0:
+                    logger.info(f"🔄 [{account_index}/{total_accounts}] 第 {retry_count + 1} 次尝试验证码...")
                 
-                # 提交验证码
-                try:
-                    # 查找验证码输入框
-                    code_selectors = [
-                        (By.CSS_SELECTOR, "input[name='pinInput']"),
-                        (By.CSS_SELECTOR, "input[jsname='ovqh0b']"),
-                    ]
+                verification_code = gptmail.wait_for_verification_code(
+                    email=email,
+                    max_wait=30,
+                    check_interval=3
+                )
+                
+                if verification_code:
+                    logger.info(f"🔐 [{account_index}/{total_accounts}] 提交验证码: {verification_code}")
                     
-                    code_input = None
-                    for by, value in code_selectors:
-                        try:
-                            code_input = wait.until(EC.presence_of_element_located((by, value)))
-                            break
-                        except:
-                            continue
-                    
-                    if code_input:
-                        # 输入完整验证码
-                        code_input.clear()
-                        code_input.send_keys(verification_code)
-                        logger.info(f"✅ [{account_index}/{total_accounts}] 已输入验证码")
-                    else:
-                        # 尝试6个独立输入框
-                        code_inputs = driver.find_elements(By.CSS_SELECTOR, "div.f7wZi[data-index='0-5'] span.hLMukf")
-                        if len(code_inputs) == 6:
-                            for i, char in enumerate(verification_code):
-                                try:
-                                    code_inputs[i].click()
-                                    time.sleep(0.1)
-                                    code_inputs[i].send_keys(char)
-                                    time.sleep(0.1)
-                                except:
-                                    pass
-                            logger.info(f"✅ [{account_index}/{total_accounts}] 已输入验证码到6个独立输入框")
-                    
-                    # 查找并点击提交按钮
-                    submit_selectors = [
-                        (By.CSS_SELECTOR, "button[jsname='XooR8e']"),
-                        (By.XPATH, "//button[contains(@aria-label, '验证')]"),
-                        (By.CSS_SELECTOR, "button[type='submit']"),
-                    ]
-                    
-                    submit_button = None
-                    for by, value in submit_selectors:
-                        try:
-                            submit_button = wait.until(EC.element_to_be_clickable((by, value)))
-                            if submit_button.is_displayed() and submit_button.is_enabled():
+                    # 提交验证码
+                    try:
+                        # 查找验证码输入框
+                        code_selectors = [
+                            (By.CSS_SELECTOR, "input[name='pinInput']"),
+                            (By.CSS_SELECTOR, "input[jsname='ovqh0b']"),
+                        ]
+                        
+                        code_input = None
+                        for by, value in code_selectors:
+                            try:
+                                code_input = wait.until(EC.presence_of_element_located((by, value)))
                                 break
-                        except:
+                            except:
+                                continue
+                        
+                        if code_input:
+                            # 输入完整验证码
+                            code_input.clear()
+                            code_input.send_keys(verification_code)
+                            logger.info(f"✅ [{account_index}/{total_accounts}] 已输入验证码")
+                        else:
+                            # 尝试6个独立输入框
+                            code_inputs = driver.find_elements(By.CSS_SELECTOR, "div.f7wZi[data-index='0-5'] span.hLMukf")
+                            if len(code_inputs) == 6:
+                                for i, char in enumerate(verification_code):
+                                    try:
+                                        code_inputs[i].click()
+                                        time.sleep(0.1)
+                                        code_inputs[i].send_keys(char)
+                                        time.sleep(0.1)
+                                    except:
+                                        pass
+                                logger.info(f"✅ [{account_index}/{total_accounts}] 已输入验证码到6个独立输入框")
+                        
+                        # 查找并点击提交按钮
+                        submit_selectors = [
+                            (By.CSS_SELECTOR, "button[jsname='XooR8e']"),
+                            (By.XPATH, "//button[contains(@aria-label, '验证')]"),
+                            (By.CSS_SELECTOR, "button[type='submit']"),
+                        ]
+                        
+                        submit_button = None
+                        for by, value in submit_selectors:
+                            try:
+                                submit_button = wait.until(EC.element_to_be_clickable((by, value)))
+                                if submit_button.is_displayed() and submit_button.is_enabled():
+                                    break
+                            except:
+                                continue
+                        
+                        if submit_button:
+                            driver.execute_script("arguments[0].click();", submit_button)
+                            logger.info(f"✅ [{account_index}/{total_accounts}] 已提交验证码")
+                            time.sleep(5)  # 等待跳转
+                            
+                            # 检查是否仍在验证页面
+                            current_url_after = driver.current_url
+                            if "verify" in current_url_after.lower() or "verification" in current_url_after.lower():
+                                logger.warning(f"⚠️ [{account_index}/{total_accounts}] 提交验证码后仍停留在验证页面，尝试重新发送验证码...")
+                                
+                                # 如果还有重试机会，点击重新发送按钮
+                                if retry_count < max_retries:
+                                    try:
+                                        # 使用固定的重新发送验证码按钮选择器
+                                        resend_button_xpath = "//span[contains(text(), '重新发送验证码')]"
+                                        resend_button = wait.until(EC.element_to_be_clickable((By.XPATH, resend_button_xpath)))
+                                        driver.execute_script("arguments[0].click();", resend_button)
+                                        logger.info(f"✅ [{account_index}/{total_accounts}] 已点击重新发送验证码按钮")
+                                        time.sleep(3)  # 等待新验证邮件
+                                        continue  # 继续下一次重试
+                                    except Exception as e:
+                                        logger.error(f"❌ [{account_index}/{total_accounts}] 点击重新发送验证码按钮失败: {e}")
+                                        break
+                                else:
+                                    # 已用完重试次数，判定为被限制
+                                    logger.error(f"❌ [{account_index}/{total_accounts}] 验证码提交失败，判定为被限制，跳过该账号")
+                                    gptmail.close()
+                                    return None
+                            else:
+                                # 成功跳转，验证码验证成功
+                                verification_success = True
+                                break
+                        else:
+                            logger.warning(f"⚠️ [{account_index}/{total_accounts}] 未找到提交按钮")
+                            if retry_count < max_retries:
+                                continue
+                            else:
+                                break
+                    
+                    except Exception as e:
+                        logger.error(f"❌ [{account_index}/{total_accounts}] 提交验证码失败: {e}")
+                        if retry_count < max_retries:
                             continue
-                    
-                    if submit_button:
-                        driver.execute_script("arguments[0].click();", submit_button)
-                        logger.info(f"✅ [{account_index}/{total_accounts}] 已提交验证码")
-                        time.sleep(5)  # 等待跳转
-                    else:
-                        logger.warning(f"⚠️ [{account_index}/{total_accounts}] 未找到提交按钮")
-                    
-                except Exception as e:
-                    logger.error(f"❌ [{account_index}/{total_accounts}] 提交验证码失败: {e}")
-                
-                gptmail.close()
-            else:
-                logger.error(f"❌ [{account_index}/{total_accounts}] 未收到验证码")
+                        else:
+                            break
+                else:
+                    logger.error(f"❌ [{account_index}/{total_accounts}] 未收到验证码")
+                    if retry_count < max_retries:
+                        # 尝试点击重新发送按钮
+                        try:
+                            resend_button_xpath = "//span[contains(text(), '重新发送验证码')]"
+                            resend_button = wait.until(EC.element_to_be_clickable((By.XPATH, resend_button_xpath)))
+                            driver.execute_script("arguments[0].click();", resend_button)
+                            logger.info(f"✅ [{account_index}/{total_accounts}] 已点击重新发送验证码按钮")
+                            time.sleep(3)  # 等待新验证邮件
+                            continue
+                        except Exception as e:
+                            logger.debug(f"[{account_index}/{total_accounts}] 未找到重新发送按钮: {e}")
+                    break
+            
+            gptmail.close()
+            
+            if not verification_success:
+                logger.error(f"❌ [{account_index}/{total_accounts}] 验证码验证失败，跳过该账号")
                 return None
         
         # 等待跳转到主页面
         time.sleep(5)
         
         # 提取配置信息
-        config = extract_config_from_browser(driver, email)
+        config = extract_config_from_browser(driver, email, account_index, total_accounts)
         
         if config:
             logger.info(f"✅ [{account_index}/{total_accounts}] 配置信息提取成功")
@@ -631,7 +761,15 @@ def login_and_update_config(account: Dict[str, str], account_index: int, total_a
         
     finally:
         if driver:
-            driver.quit()
+            try:
+                driver.quit()
+            except Exception as e:
+                logger.debug(f"[{account_index}/{total_accounts}] 关闭浏览器时出错: {e}")
+            finally:
+                # 从全局列表中移除
+                with _drivers_lock:
+                    if driver in _active_drivers:
+                        _active_drivers.remove(driver)
 
 
 def update_config_file(accounts: List[Dict[str, str]], file_path: str):
@@ -730,9 +868,18 @@ def main():
             try:
                 result = future.result()
                 results[account_index] = result
+                # 检查是否真正更新成功：需要新配置存在且与原配置不同
+                original_account = accounts[account_index]
                 if result and result.get('CONFIG_ID'):
-                    success_count += 1
-                    logger.info(f"✅ 账号 {account_index + 1} 更新成功")
+                    # 比较新旧配置的 CONFIG_ID，如果相同说明没有真正更新
+                    original_config_id = original_account.get('CONFIG_ID', '')
+                    new_config_id = result.get('CONFIG_ID', '')
+                    if new_config_id and new_config_id != original_config_id:
+                        success_count += 1
+                        logger.info(f"✅ 账号 {account_index + 1} 更新成功")
+                    else:
+                        fail_count += 1
+                        logger.error(f"❌ 账号 {account_index + 1} 更新失败（配置未变化或提取失败）")
                 else:
                     fail_count += 1
                     logger.error(f"❌ 账号 {account_index + 1} 更新失败")

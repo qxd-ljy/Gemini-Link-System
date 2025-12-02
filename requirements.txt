@@ -24,3 +24,6 @@ websockets==15.0.1
 
 # 定时任务
 apscheduler==3.10.4
+
+# 浏览器自动化（用于保活任务）
+selenium==4.27.1

@@ -16,6 +16,7 @@ import logging
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Depends, WebSocket, WebSocketDisconnect  # noqa: F401
+from contextlib import asynccontextmanager
 from fastapi.responses import StreamingResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -25,6 +26,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import subprocess
 import sys
+import signal
 
 from database import init_db, get_db, Admin, APIKey, APICallLog, KeepAliveTask, KeepAliveLog, KeepAliveAccountLog, AccountCookieStatus
 from auth import (
@@ -857,8 +859,61 @@ def parse_images_from_response(data_list: list) -> tuple[list, Optional[str]]:
     return file_ids, current_session
 
 
+# ---------- 应用生命周期管理 ----------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理"""
+    # 启动时执行
+    init_db()
+    db = next(get_db())
+    try:
+        init_admin(db)
+        
+        # 清理遗留的"running"状态（可能是上次异常退出导致的）
+        running_logs = db.query(KeepAliveLog).filter(
+            KeepAliveLog.status == "running"
+        ).all()
+        for log in running_logs:
+            log.status = "error"
+            log.finished_at = get_beijing_time()
+            log.message = "服务重启，进程已终止"
+            
+            # 更新所有运行中的账号日志
+            running_account_logs = db.query(KeepAliveAccountLog).filter(
+                KeepAliveAccountLog.task_log_id == log.id,
+                KeepAliveAccountLog.status == "running"
+            ).all()
+            for acc_log in running_account_logs:
+                acc_log.status = "error"
+                acc_log.finished_at = get_beijing_time()
+                acc_log.message = "服务重启，进程已终止"
+        
+        # 更新任务状态
+        task = db.query(KeepAliveTask).first()
+        if task and task.last_status == "running":
+            task.last_status = "error"
+            task.last_message = "服务重启，进程已终止"
+        
+        db.commit()
+    finally:
+        db.close()
+    
+    # 启动定时任务调度器
+    scheduler.start()
+    setup_keep_alive_scheduler()
+    
+    yield  # 应用运行期间
+    
+    # 关闭时执行
+    try:
+        scheduler.shutdown()
+        await http_client.aclose()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ---------- OpenAI 兼容接口 ----------
-app = FastAPI(title="Gemini-Business OpenAI Gateway")
+app = FastAPI(title="Gemini-Business OpenAI Gateway", lifespan=lifespan)
 
 # 挂载静态文件
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -2532,16 +2587,86 @@ async def cancel_keep_alive_task(
             raise HTTPException(status_code=400, detail="没有正在执行的保活任务")
         
         try:
-            # 终止进程
-            current_keep_alive_process.terminate()
+            # 先发送中断信号，让子进程有机会清理浏览器
+            logger.info("🛑 正在中断保活任务，等待浏览器关闭...")
             try:
-                # 等待5秒，如果还没结束就强制杀死
+                if sys.platform == 'win32':
+                    # Windows 上尝试发送 SIGINT（如果支持）
+                    try:
+                        current_keep_alive_process.send_signal(signal.SIGINT)
+                    except (AttributeError, ValueError):
+                        # 如果不支持 send_signal，使用 terminate
+                        current_keep_alive_process.terminate()
+                else:
+                    # Unix 系统上使用 SIGTERM
+                    current_keep_alive_process.terminate()
+            except Exception as e:
+                logger.warning(f"发送中断信号失败: {e}，尝试直接终止")
+                # 如果发送信号失败，直接终止
+                current_keep_alive_process.terminate()
+            
+            try:
+                # 等待5秒，让子进程有时间清理浏览器
                 await asyncio.wait_for(
                     asyncio.to_thread(current_keep_alive_process.wait),
                     timeout=5
                 )
+                logger.info("✅ 保活任务已正常终止")
             except asyncio.TimeoutError:
-                current_keep_alive_process.kill()
+                # 如果5秒后还没结束，强制杀死
+                logger.warning("⚠️ 保活任务未在5秒内正常终止，强制终止进程...")
+                try:
+                    current_keep_alive_process.kill()
+                    await asyncio.wait_for(
+                        asyncio.to_thread(current_keep_alive_process.wait),
+                        timeout=2
+                    )
+                except Exception as e:
+                    logger.error(f"强制终止进程失败: {e}")
+            
+            # 无论子进程如何终止，都尝试关闭由 Selenium 启动的 Edge 浏览器窗口（Windows 上）
+            # 注意：只关闭明确由 Selenium 启动的 Edge，不会关闭用户正在使用的 Edge
+            if sys.platform == 'win32':
+                try:
+                    logger.info("🔍 检查并关闭残留的 Edge 浏览器窗口（仅限保活任务启动的）...")
+                    closed_count = 0
+                    
+                    # 直接关闭 msedgedriver 进程及其所有子进程（包括 Edge 浏览器）
+                    # 这是最快最可靠的方法，因为 Selenium 启动的 Edge 都是 msedgedriver 的子进程
+                    try:
+                        kill_driver_cmd = ['taskkill', '/F', '/IM', 'msedgedriver.exe', '/T']
+                        kill_result = subprocess.run(
+                            kill_driver_cmd,
+                            capture_output=True,
+                            text=True,
+                            timeout=3,
+                            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+                        )
+                        if kill_result.returncode == 0:
+                            # 统计关闭的进程数量（从输出中提取）
+                            output = kill_result.stdout or ""
+                            if "成功" in output or "successfully" in output.lower():
+                                # 尝试从输出中提取数量
+                                import re
+                                match = re.search(r'(\d+)', output)
+                                if match:
+                                    closed_count = int(match.group(1))
+                                else:
+                                    closed_count = 1  # 至少关闭了 msedgedriver
+                    except subprocess.TimeoutError:
+                        logger.debug("关闭 msedgedriver 超时")
+                    except Exception as e:
+                        logger.debug(f"关闭 msedgedriver 时出错: {e}")
+                    
+                    if closed_count > 0:
+                        time.sleep(0.5)  # 减少等待时间
+                        logger.info(f"✅ 已关闭 {closed_count} 个由保活任务启动的 Edge 浏览器窗口")
+                    else:
+                        logger.info("ℹ️ 没有发现残留的 Edge 浏览器窗口（由保活任务启动的）")
+                        
+                except Exception as e:
+                    logger.warning(f"⚠️ 尝试关闭 Edge 浏览器时出错: {e}")
+                    logger.info("💡 如有残留的浏览器窗口，请手动关闭")
             
             # 更新日志状态
             db = next(get_db())
@@ -4161,6 +4286,8 @@ async def execute_keep_alive_task():
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,  # 将 stderr 合并到 stdout，确保错误也能被读取
                     text=True,
+                    encoding='utf-8',  # 明确指定 UTF-8 编码，确保 Unicode 字符正确显示
+                    errors='replace',  # 遇到编码错误时替换而不是报错
                     cwd=BASE_DIR,
                     bufsize=0  # 无缓冲
                 )
@@ -4469,57 +4596,6 @@ def setup_keep_alive_scheduler():
         logger.error(f"❌ 设置保活任务调度器失败: {e}")
     finally:
         db.close()
-
-
-@app.on_event("startup")
-async def _startup_event() -> None:
-    """启动时初始化数据库和管理员账号"""
-    init_db()
-    db = next(get_db())
-    try:
-        init_admin(db)
-        
-        # 清理遗留的"running"状态（可能是上次异常退出导致的）
-        running_logs = db.query(KeepAliveLog).filter(
-            KeepAliveLog.status == "running"
-        ).all()
-        for log in running_logs:
-            log.status = "error"
-            log.finished_at = get_beijing_time()
-            log.message = "服务重启，进程已终止"
-            
-            # 更新所有运行中的账号日志
-            running_account_logs = db.query(KeepAliveAccountLog).filter(
-                KeepAliveAccountLog.task_log_id == log.id,
-                KeepAliveAccountLog.status == "running"
-            ).all()
-            for acc_log in running_account_logs:
-                acc_log.status = "error"
-                acc_log.finished_at = get_beijing_time()
-                acc_log.message = "服务重启，进程已终止"
-        
-        # 更新任务状态
-        task = db.query(KeepAliveTask).first()
-        if task and task.last_status == "running":
-            task.last_status = "error"
-            task.last_message = "服务重启，进程已终止"
-        
-        db.commit()
-    finally:
-        db.close()
-    
-    # 启动定时任务调度器
-    scheduler.start()
-    setup_keep_alive_scheduler()
-
-
-@app.on_event("shutdown")
-async def _shutdown_event() -> None:
-    try:
-        scheduler.shutdown()
-        await http_client.aclose()
-    except Exception:  # noqa: BLE001
-        pass
 
 
 if __name__ == "__main__":
