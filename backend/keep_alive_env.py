@@ -243,7 +243,11 @@ def update_single_account_from_env(account: Dict[str, str], account_index: int, 
     
     # 构建 update_configs.py 期望的格式
     account_for_update = {
-        "Name": email  # update_configs.py 使用 Name 字段作为邮箱
+        "Name": email,  # update_configs.py 使用 Name 字段作为邮箱
+        "SECURE_C_SES": account.get("secure_c_ses", ""),
+        "CSESIDX": account.get("csesidx", ""),
+        "CONFIG_ID": account.get("config_id", ""),
+        "HOST_C_OSES": account.get("host_c_oses", ""),
     }
     
     start_time = time.time()

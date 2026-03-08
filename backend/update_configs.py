@@ -12,16 +12,17 @@ import threading
 import sys
 import os
 import io
+import json
 from typing import List, Dict, Optional, Any
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.edge.options import Options
-from selenium.webdriver.edge.service import Service
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 import httpx
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, parse_qs
+from edge_driver_utils import create_edge_driver
 
 # 全局变量：存储所有打开的浏览器驱动，用于中断时关闭
 _active_drivers: List[webdriver.Edge] = []
@@ -377,7 +378,90 @@ def parse_config_file(file_path: str) -> List[Dict[str, str]]:
         return []
 
 
-def extract_config_from_browser(driver: webdriver.Edge, email: str, account_index: int = 0, total_accounts: int = 0) -> Optional[Dict[str, str]]:
+def _extract_ids_from_url(url: str) -> Dict[str, Optional[str]]:
+    config_id = None
+    csesidx = None
+
+    if not url:
+        return {"CONFIG_ID": None, "CSESIDX": None}
+
+    parsed = urlparse(url)
+    path_parts = [part for part in parsed.path.split('/') if part]
+    for index, part in enumerate(path_parts):
+        if part == 'cid' and index + 1 < len(path_parts):
+            config_id = path_parts[index + 1]
+            break
+
+    query = parse_qs(parsed.query)
+    if query.get('csesidx'):
+        csesidx = query['csesidx'][0]
+    if not config_id:
+        config_id = (query.get('config_id') or query.get('configId') or query.get('cid') or [None])[0]
+
+    return {"CONFIG_ID": config_id, "CSESIDX": csesidx}
+
+
+def _extract_ids_from_browser_storage(driver: webdriver.Edge) -> Dict[str, Optional[str]]:
+    script = """
+    const result = {configId: null, csesidx: null};
+    const visited = new Set();
+    const collect = (value) => {
+        if (value == null) return;
+        if (typeof value === 'string') {
+            try {
+                collect(JSON.parse(value));
+            } catch (_) {
+                const cidMatch = value.match(/(?:config[_-]?id|cid)["'=:\s]+([a-f0-9-]{16,})/i);
+                if (!result.configId && cidMatch) result.configId = cidMatch[1];
+                const idxMatch = value.match(/csesidx["'=:\s]+([0-9]+)/i);
+                if (!result.csesidx && idxMatch) result.csesidx = idxMatch[1];
+            }
+            return;
+        }
+        if (typeof value !== 'object') return;
+        if (visited.has(value)) return;
+        visited.add(value);
+        for (const [key, item] of Object.entries(value)) {
+            const lowerKey = String(key).toLowerCase();
+            if (!result.configId && (lowerKey === 'configid' || lowerKey === 'config_id' || lowerKey === 'cid') && typeof item === 'string') {
+                result.configId = item;
+            }
+            if (!result.csesidx && lowerKey === 'csesidx') {
+                result.csesidx = String(item);
+            }
+            if (result.configId && result.csesidx) return;
+            collect(item);
+            if (result.configId && result.csesidx) return;
+        }
+    };
+
+    const stores = [window.localStorage, window.sessionStorage];
+    for (const store of stores) {
+        if (!store) continue;
+        for (let i = 0; i < store.length; i++) {
+            const key = store.key(i);
+            collect(key);
+            collect(store.getItem(key));
+            if (result.configId && result.csesidx) return result;
+        }
+    }
+
+    collect(window.__INITIAL_STATE__);
+    collect(window.__NEXT_DATA__);
+    return result;
+    """
+
+    try:
+        data = driver.execute_script(script) or {}
+        return {
+            "CONFIG_ID": data.get("configId"),
+            "CSESIDX": data.get("csesidx"),
+        }
+    except Exception:
+        return {"CONFIG_ID": None, "CSESIDX": None}
+
+
+def extract_config_from_browser(driver: webdriver.Edge, email: str, account_index: int = 0, total_accounts: int = 0, existing_config: Optional[Dict[str, str]] = None) -> Optional[Dict[str, str]]:
     """
     从浏览器中提取配置信息
     
@@ -404,23 +488,10 @@ def extract_config_from_browser(driver: webdriver.Edge, email: str, account_inde
             logger.warning(f"{prefix} ⚠️ 当前不在 Gemini Business 页面: {current_url}")
             return None
         
-        # 提取 CONFIG_ID (从路径 /cid/ 后面)
-        config_id = None
-        path_parts = current_url.split('/')
-        for i, part in enumerate(path_parts):
-            if part == 'cid' and i + 1 < len(path_parts):
-                config_id = path_parts[i + 1]
-                break
-        
-        # 提取 CSESIDX (从 URL 参数)
-        csesidx = None
-        if '?' in current_url:
-            url_params = current_url.split('?')[1]
-            params = url_params.split('&')
-            for param in params:
-                if param.startswith('csesidx='):
-                    csesidx = param.split('=')[1]
-                    break
+        existing_config = existing_config or {}
+        ids_from_url = _extract_ids_from_url(current_url)
+        config_id = ids_from_url.get("CONFIG_ID") or existing_config.get("CONFIG_ID")
+        csesidx = ids_from_url.get("CSESIDX") or existing_config.get("CSESIDX")
         
         # 提取 Cookie 信息（包括过期时间）
         cookies = driver.get_cookies()
@@ -457,21 +528,9 @@ def extract_config_from_browser(driver: webdriver.Edge, email: str, account_inde
             logger.info(f"{prefix} ⏳ 等待页面完全加载...")
             time.sleep(10)
             current_url = driver.current_url
-            
-            # 重新提取
-            path_parts = current_url.split('/')
-            for i, part in enumerate(path_parts):
-                if part == 'cid' and i + 1 < len(path_parts):
-                    config_id = path_parts[i + 1]
-                    break
-            
-            if '?' in current_url:
-                url_params = current_url.split('?')[1]
-                params = url_params.split('&')
-                for param in params:
-                    if param.startswith('csesidx='):
-                        csesidx = param.split('=')[1]
-                        break
+            ids_from_url = _extract_ids_from_url(current_url)
+            config_id = ids_from_url.get("CONFIG_ID") or config_id
+            csesidx = ids_from_url.get("CSESIDX") or csesidx
             
             # 重新获取 Cookie
             cookies = driver.get_cookies()
@@ -480,6 +539,20 @@ def extract_config_from_browser(driver: webdriver.Edge, email: str, account_inde
                     secure_c_ses = cookie['value']
                 elif cookie['name'] == '__Host-C_OSES' and cookie.get('domain', '').endswith('gemini.google'):
                     host_c_oses = cookie['value']
+
+        if not config_id or not csesidx:
+            ids_from_storage = _extract_ids_from_browser_storage(driver)
+            config_id = ids_from_storage.get("CONFIG_ID") or config_id or existing_config.get("CONFIG_ID")
+            csesidx = ids_from_storage.get("CSESIDX") or csesidx or existing_config.get("CSESIDX")
+
+        if not host_c_oses and existing_config.get('HOST_C_OSES'):
+            host_c_oses = existing_config.get('HOST_C_OSES')
+
+        if secure_c_ses and (existing_config.get("CONFIG_ID") or existing_config.get("CSESIDX")):
+            if not ids_from_url.get("CONFIG_ID") and existing_config.get("CONFIG_ID"):
+                logger.info(f"{prefix} ℹ️ 当前页面未直接暴露 CONFIG_ID，回退使用现有配置")
+            if not ids_from_url.get("CSESIDX") and existing_config.get("CSESIDX"):
+                logger.info(f"{prefix} ℹ️ 当前页面未直接暴露 CSESIDX，回退使用现有配置")
         
         if config_id and csesidx and secure_c_ses:
             return {
@@ -562,8 +635,12 @@ def login_and_update_config(account: Dict[str, str], account_index: int, total_a
             edge_options.add_argument("--headless")
         
         # 启动浏览器（FilteredStderr 已经在模块级别设置，会自动过滤错误）
-        service = Service()
-        driver = webdriver.Edge(options=edge_options, service=service)
+        driver = create_edge_driver(
+            options=edge_options,
+            logger=logger,
+            log_prefix=f"[{account_index}/{total_accounts}]",
+            suppress_stderr=True,
+        )
         
         # 将驱动添加到全局列表，用于中断时关闭
         with _drivers_lock:
@@ -744,7 +821,7 @@ def login_and_update_config(account: Dict[str, str], account_index: int, total_a
         time.sleep(5)
         
         # 提取配置信息
-        config = extract_config_from_browser(driver, email, account_index, total_accounts)
+        config = extract_config_from_browser(driver, email, account_index, total_accounts, existing_config=account)
         
         if config:
             logger.info(f"✅ [{account_index}/{total_accounts}] 配置信息提取成功")

@@ -22,9 +22,9 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.edge.options import Options
-from selenium.webdriver.edge.service import Service
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 import httpx
+from edge_driver_utils import create_edge_driver
 
 # 配置日志
 logging.basicConfig(
@@ -357,25 +357,12 @@ class GoogleBusinessLoginSelenium:
             edge_options.add_argument(f"--proxy-server={self.proxy}")
         
         try:
-            import subprocess
-            import sys
-            
-            service = Service()
-            
-            try:
-                if sys.platform == 'win32':
-                    import os
-                    old_stderr = sys.stderr
-                    with open(os.devnull, 'w') as devnull:
-                        sys.stderr = devnull
-                        try:
-                            self.driver = webdriver.Edge(options=edge_options, service=service)
-                        finally:
-                            sys.stderr = old_stderr
-                else:
-                    self.driver = webdriver.Edge(options=edge_options, service=service)
-            except:
-                self.driver = webdriver.Edge(options=edge_options, service=service)
+            self.driver = create_edge_driver(
+                options=edge_options,
+                logger=logger,
+                log_prefix=self._log_prefix(),
+                suppress_stderr=True,
+            )
             
             # 执行反检测脚本
             self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
